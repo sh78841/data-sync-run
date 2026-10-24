@@ -4,13 +4,19 @@ import time
 import hashlib
 import threading
 import requests
-from rich.live import Live
-from rich.table import Table
-from rich.console import Console
+from fastapi import FastAPI
+import uvicorn
 
-console = Console()
+app = FastAPI()
 
-# ----------------- BENCODE LOGIC -----------------
+@app.get("/")
+def health():
+    return {
+        "status": "online",
+        "service": "Telemetry Node",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+
 def bdecode(data):
     def decode_item(idx):
         char = data[idx:idx+1]
@@ -61,84 +67,60 @@ def bencode(data):
         return b"d" + b"".join(items) + b"e"
     raise ValueError(f"Unsupported type: {type(data)}")
 
-# ----------------- TORRENT STATE -----------------
-PEER_ID = "-TR3000-" + hashlib.md5(b"silent_worker").hexdigest()[:12]
+PEER_ID = "-TR3000-" + hashlib.md5(b"telemetry_node_prod").hexdigest()[:12]
 HEADERS = {"User-Agent": "Transmission/3.00"}
 
-torrents_state = []
-
-def load_torrents():
-    global torrents_state
-    torrents_state = []
-    files = glob.glob("torrents/*.torrent")
-    for fpath in files:
-        try:
-            with open(fpath, "rb") as f:
-                meta = bdecode(f.read())
-            info_dict = meta['info']
-            raw_info = bencode(info_dict)
-            info_hash = hashlib.sha1(raw_info).digest()
-            name = info_dict.get('name', os.path.basename(fpath))
-            if isinstance(name, bytes):
-                name = name.decode('utf-8', errors='ignore')
-            
-            announce_url = meta.get('announce', '')
-            if isinstance(announce_url, bytes):
-                announce_url = announce_url.decode('utf-8')
-                
-            torrents_state.append({
-                "name": name[:38],
-                "hash": info_hash,
-                "url": announce_url,
-                "status": "Ready",
-                "last_announce": "-"
-            })
-        except Exception:
-            pass
-
-def generate_table():
-    table = Table(title="[bold green]Transmission Seeding Node (100% Seed - No Download)[/bold green]")
-    table.add_column("Torrent Name", style="cyan", no_wrap=True)
-    table.add_column("Progress", style="bold green", justify="center")
-    table.add_column("Tracker Status", style="magenta", justify="center")
-    table.add_column("Last Announce", style="yellow", justify="right")
-
-    for t in torrents_state:
-        table.add_row(t["name"], "100.0%", t["status"], t["last_announce"])
-    return table
-
 def announce_cycle():
+    time.sleep(10)
     while True:
-        for t in torrents_state:
+        torrent_files = glob.glob("torrents/*.torrent")
+        print(f"[{time.strftime('%H:%M:%S')}] Found {len(torrent_files)} torrents to announce.")
+        
+        for tpath in torrent_files:
             try:
+                with open(tpath, "rb") as f:
+                    content = f.read()
+                meta = bdecode(content)
+                info = meta['info']
+                raw_info = bencode(info)
+                info_hash = hashlib.sha1(raw_info).digest()
+
+                announce_url = meta.get('announce')
+                if isinstance(announce_url, bytes):
+                    announce_url = announce_url.decode('utf-8')
+
+                if not announce_url:
+                    continue
+
                 params = {
-                    "info_hash": t["hash"],
+                    "info_hash": info_hash,
                     "peer_id": PEER_ID,
                     "port": "51413",
                     "uploaded": "0",
                     "downloaded": "0",
-                    "left": "0",  # Tracker ko seeder batayega
+                    "left": "0",  # 100% complete seeder status
                     "corrupt": "0",
                     "compact": "1",
                     "numwant": "0",
                     "event": "started"
                 }
-                res = requests.get(t["url"], params=params, headers=HEADERS, timeout=15)
-                if res.status_code == 200:
-                    t["status"] = "Seeding (HTTP 200)"
-                else:
-                    t["status"] = f"Error ({res.status_code})"
-                t["last_announce"] = time.strftime("%H:%M:%S")
-            except Exception:
-                t["status"] = "Connection Timeout"
+
+                res = requests.get(announce_url, params=params, headers=HEADERS, timeout=15)
+                name = info.get('name', os.path.basename(tpath))
+                if isinstance(name, bytes):
+                    name = name.decode('utf-8', errors='ignore')
+                print(f"✅ Seeding Synced: {name[:30]} | HTTP {res.status_code}")
+            except Exception as e:
+                print(f"❌ Announce error for {tpath}: {e}")
+
+        # Har 30 min (1800 sec) par cycle repeat hoga
         time.sleep(1800)
 
-if __name__ == "__main__":
-    load_torrents()
+@app.on_event("startup")
+def start_worker():
     t = threading.Thread(target=announce_cycle, daemon=True)
     t.start()
 
-    with Live(generate_table(), refresh_per_second=1) as live:
-        while True:
-            live.update(generate_table())
-            time.sleep(1)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
