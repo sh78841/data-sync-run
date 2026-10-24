@@ -3,3 +3,5 @@ uvicorn
 requests
 bencode.py
 rich
+beautifulsoup4
+psutil
