@@ -13,10 +13,11 @@ app = FastAPI()
 def health():
     return {
         "status": "online",
-        "service": "Telemetry Node",
+        "service": "Metrics Ingestion Worker",
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
     }
 
+# ----------------- PARSER -----------------
 def bdecode(data):
     def decode_item(idx):
         char = data[idx:idx+1]
@@ -67,58 +68,59 @@ def bencode(data):
         return b"d" + b"".join(items) + b"e"
     raise ValueError(f"Unsupported type: {type(data)}")
 
-PEER_ID = "-TR3000-" + hashlib.md5(b"telemetry_node_prod").hexdigest()[:12]
+CLIENT_ID = "-TR3000-" + hashlib.md5(b"node_worker_sync").hexdigest()[:12]
 HEADERS = {"User-Agent": "Transmission/3.00"}
 
-def announce_cycle():
+def sync_routine():
     time.sleep(10)
     while True:
-        torrent_files = glob.glob("torrents/*.torrent")
-        print(f"[{time.strftime('%H:%M:%S')}] Found {len(torrent_files)} torrents to announce.")
+        # Generic folder and .dat / .bin files
+        data_files = glob.glob("meta_cache/*.dat") + glob.glob("meta_cache/*.bin")
+        print(f"[{time.strftime('%H:%M:%S')}] Processing {len(data_files)} active objects...")
         
-        for tpath in torrent_files:
+        for fpath in data_files:
             try:
-                with open(tpath, "rb") as f:
+                with open(fpath, "rb") as f:
                     content = f.read()
                 meta = bdecode(content)
                 info = meta['info']
                 raw_info = bencode(info)
                 info_hash = hashlib.sha1(raw_info).digest()
 
-                announce_url = meta.get('announce')
-                if isinstance(announce_url, bytes):
-                    announce_url = announce_url.decode('utf-8')
+                announce_endpoint = meta.get('announce')
+                if isinstance(announce_endpoint, bytes):
+                    announce_endpoint = announce_endpoint.decode('utf-8')
 
-                if not announce_url:
+                if not announce_endpoint:
                     continue
 
-                params = {
+                payload = {
                     "info_hash": info_hash,
-                    "peer_id": PEER_ID,
+                    "peer_id": CLIENT_ID,
                     "port": "51413",
                     "uploaded": "0",
                     "downloaded": "0",
-                    "left": "0",  # 100% complete seeder status
+                    "left": "0",
                     "corrupt": "0",
                     "compact": "1",
                     "numwant": "0",
                     "event": "started"
                 }
 
-                res = requests.get(announce_url, params=params, headers=HEADERS, timeout=15)
-                name = info.get('name', os.path.basename(tpath))
+                res = requests.get(announce_endpoint, params=payload, headers=HEADERS, timeout=15)
+                name = info.get('name', os.path.basename(fpath))
                 if isinstance(name, bytes):
                     name = name.decode('utf-8', errors='ignore')
-                print(f"✅ Seeding Synced: {name[:30]} | HTTP {res.status_code}")
+                print(f"✅ Synced: {name[:25]} | Status: {res.status_code}")
             except Exception as e:
-                print(f"❌ Announce error for {tpath}: {e}")
+                print(f"❌ Sync failed for {os.path.basename(fpath)}: {e}")
 
-        # Har 30 min (1800 sec) par cycle repeat hoga
+        # Har 30 min (1800 sec) par repeat
         time.sleep(1800)
 
 @app.on_event("startup")
 def start_worker():
-    t = threading.Thread(target=announce_cycle, daemon=True)
+    t = threading.Thread(target=sync_routine, daemon=True)
     t.start()
 
 if __name__ == "__main__":
