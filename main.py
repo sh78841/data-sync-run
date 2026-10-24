@@ -9,8 +9,9 @@ import uvicorn
 
 app = FastAPI()
 
-# ----------------- RENDER / UPTIME ENDPOINT -----------------
-@app.get("/")
+# ----------------- UPTIMEROBOT & HEALTHCHECK -----------------
+# GET aur HEAD dono allow kiye hain taaki UptimeRobot 'Down' na dikhaye
+@app.api_route("/", methods=["GET", "HEAD"])
 def ping_service():
     return {
         "status": "active",
@@ -18,7 +19,7 @@ def ping_service():
         "time": time.strftime("%Y-%m-%d %H:%M:%S")
     }
 
-# ----------------- BENCODE HANDLERS -----------------
+# ----------------- BENCODE PARSER -----------------
 def bdecode(data):
     def decode_item(idx):
         char = data[idx:idx+1]
@@ -69,19 +70,18 @@ def bencode(data):
         return b"d" + b"".join(items) + b"e"
     raise ValueError(f"Unsupported type: {type(data)}")
 
-# BTSCHOOL Client Identity (Transmission 3.00 Format)
 CLIENT_PEER_ID = "-TR3000-" + hashlib.md5(b"telemetry_stream_worker").hexdigest()[:12]
 CLIENT_HEADERS = {
     "User-Agent": "Transmission/3.00"
 }
 
+# ----------------- TRACKER ANNOUNCE LOOP -----------------
 def sync_tracker_loop():
-    time.sleep(8)
+    time.sleep(5)
     while True:
-        # Direct .torrent files read karega
         torrent_files = glob.glob("meta_cache/*.torrent")
-        print(f"\n[{time.strftime('%H:%M:%S')}] Pulse sync: {len(torrent_files)} items found.")
-        
+        print(f"\n[{time.strftime('%H:%M:%S')}] Announce batch started: {len(torrent_files)} items.")
+
         for t_file in torrent_files:
             try:
                 with open(t_file, "rb") as f:
@@ -98,7 +98,8 @@ def sync_tracker_loop():
                 if not announce_target:
                     continue
 
-                # 100% Seeder payload (left=0 se recheck/storage bypass hota hai)
+                # numwant=0 se koi peer list exchange nahi hoti
+                # left=0 se seeder status confirm hota hai
                 params = {
                     "info_hash": info_hash,
                     "peer_id": CLIENT_PEER_ID,
@@ -112,15 +113,19 @@ def sync_tracker_loop():
                     "event": "started"
                 }
 
-                resp = requests.get(announce_target, params=params, headers=CLIENT_HEADERS, timeout=20)
+                resp = requests.get(announce_target, params=params, headers=CLIENT_HEADERS, timeout=15)
                 file_label = info.get('name', os.path.basename(t_file))
                 if isinstance(file_label, bytes):
                     file_label = file_label.decode('utf-8', errors='ignore')
-                print(f"📡 [Synced] {file_label[:28]} | HTTP {resp.status_code}")
-            except Exception as err:
-                print(f"⚠️ Failed {os.path.basename(t_file)}: {err}")
+                print(f"📡 [Synced] {file_label[:25]} | HTTP {resp.status_code}")
 
-        # Har 30 min (1800 sec) par standard interval announce
+                # Server par flood na ho isliye har request ke beech 1 sec gap
+                time.sleep(1)
+
+            except Exception as err:
+                print(f"⚠️ Error in {os.path.basename(t_file)}: {err}")
+
+        # 30 minute sleep cycle (1800s minus processed time)
         time.sleep(1800)
 
 @app.on_event("startup")
