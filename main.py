@@ -9,15 +9,16 @@ import uvicorn
 
 app = FastAPI()
 
+# ----------------- RENDER / UPTIME ENDPOINT -----------------
 @app.get("/")
-def health():
+def ping_service():
     return {
-        "status": "online",
-        "service": "Metrics Ingestion Worker",
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+        "status": "active",
+        "node": "telemetry-sync",
+        "time": time.strftime("%Y-%m-%d %H:%M:%S")
     }
 
-# ----------------- PARSER -----------------
+# ----------------- BENCODE HANDLERS -----------------
 def bdecode(data):
     def decode_item(idx):
         char = data[idx:idx+1]
@@ -68,35 +69,39 @@ def bencode(data):
         return b"d" + b"".join(items) + b"e"
     raise ValueError(f"Unsupported type: {type(data)}")
 
-CLIENT_ID = "-TR3000-" + hashlib.md5(b"node_worker_sync").hexdigest()[:12]
-HEADERS = {"User-Agent": "Transmission/3.00"}
+# BTSCHOOL Client Identity (Transmission 3.00 Format)
+CLIENT_PEER_ID = "-TR3000-" + hashlib.md5(b"telemetry_stream_worker").hexdigest()[:12]
+CLIENT_HEADERS = {
+    "User-Agent": "Transmission/3.00"
+}
 
-def sync_routine():
-    time.sleep(10)
+def sync_tracker_loop():
+    time.sleep(8)
     while True:
-        # Generic folder and .dat / .bin files
-        data_files = glob.glob("meta_cache/*.dat") + glob.glob("meta_cache/*.bin")
-        print(f"[{time.strftime('%H:%M:%S')}] Processing {len(data_files)} active objects...")
+        # Direct .torrent files read karega
+        torrent_files = glob.glob("meta_cache/*.torrent")
+        print(f"\n[{time.strftime('%H:%M:%S')}] Pulse sync: {len(torrent_files)} items found.")
         
-        for fpath in data_files:
+        for t_file in torrent_files:
             try:
-                with open(fpath, "rb") as f:
+                with open(t_file, "rb") as f:
                     content = f.read()
                 meta = bdecode(content)
                 info = meta['info']
                 raw_info = bencode(info)
                 info_hash = hashlib.sha1(raw_info).digest()
 
-                announce_endpoint = meta.get('announce')
-                if isinstance(announce_endpoint, bytes):
-                    announce_endpoint = announce_endpoint.decode('utf-8')
+                announce_target = meta.get('announce')
+                if isinstance(announce_target, bytes):
+                    announce_target = announce_target.decode('utf-8')
 
-                if not announce_endpoint:
+                if not announce_target:
                     continue
 
-                payload = {
+                # 100% Seeder payload (left=0 se recheck/storage bypass hota hai)
+                params = {
                     "info_hash": info_hash,
-                    "peer_id": CLIENT_ID,
+                    "peer_id": CLIENT_PEER_ID,
                     "port": "51413",
                     "uploaded": "0",
                     "downloaded": "0",
@@ -107,21 +112,21 @@ def sync_routine():
                     "event": "started"
                 }
 
-                res = requests.get(announce_endpoint, params=payload, headers=HEADERS, timeout=15)
-                name = info.get('name', os.path.basename(fpath))
-                if isinstance(name, bytes):
-                    name = name.decode('utf-8', errors='ignore')
-                print(f"✅ Synced: {name[:25]} | Status: {res.status_code}")
-            except Exception as e:
-                print(f"❌ Sync failed for {os.path.basename(fpath)}: {e}")
+                resp = requests.get(announce_target, params=params, headers=CLIENT_HEADERS, timeout=20)
+                file_label = info.get('name', os.path.basename(t_file))
+                if isinstance(file_label, bytes):
+                    file_label = file_label.decode('utf-8', errors='ignore')
+                print(f"📡 [Synced] {file_label[:28]} | HTTP {resp.status_code}")
+            except Exception as err:
+                print(f"⚠️ Failed {os.path.basename(t_file)}: {err}")
 
-        # Har 30 min (1800 sec) par repeat
+        # Har 30 min (1800 sec) par standard interval announce
         time.sleep(1800)
 
 @app.on_event("startup")
-def start_worker():
-    t = threading.Thread(target=sync_routine, daemon=True)
-    t.start()
+def start_sync():
+    worker_th = threading.Thread(target=sync_tracker_loop, daemon=True)
+    worker_th.start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
