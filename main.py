@@ -5,27 +5,33 @@ import hashlib
 import threading
 import sqlite3
 import re
+import gc
 import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, HTTPException
 import uvicorn
 import psutil
 
 app = FastAPI()
 
+START_TIME = time.time()
+CURRENT_PUBLIC_IP = None
+
 # =====================================================================
-# CONFIGURATION & CREDENTIALS
+# CONFIGURATION
 # =====================================================================
 TG_BOT_TOKEN = "8403175184:AAFLZY6yHWNb8DxvZ8ZmdZIKw6ZuTebc8aA"
 TG_CHAT_ID = "6519226948"
 
-TRACKER_INTERVAL_SECONDS = 1800  # 30 mins
-JOB_INTERVAL_SECONDS = 1800      # 30 mins
-
+TRACKER_INTERVAL_SECONDS = 1800   # 30 mins
+JOB_INTERVAL_SECONDS = 10800      # 3 Hours (10800s)
 DB_FILE = "jobs_cache.db"
+META_DIR = "meta_cache"
+
+os.makedirs(META_DIR, exist_ok=True)
 
 # =====================================================================
-# DEDUPLICATION DATABASE (ZERO-REPEAT ALERTS)
+# DATABASE & RETENTION (2 DAYS PURGE)
 # =====================================================================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -40,6 +46,16 @@ def init_db():
     """)
     conn.commit()
     conn.close()
+
+def cleanup_old_seen_jobs():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("DELETE FROM seen_jobs WHERE posted_at < datetime('now', '-2 days')")
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[DB-CLEAN] Error: {e}")
 
 def is_job_seen(job_id: str) -> bool:
     conn = sqlite3.connect(DB_FILE)
@@ -56,47 +72,39 @@ def mark_job_seen(job_id: str, source: str, title: str):
     conn.commit()
     conn.close()
 
-# =====================================================================
-# TELEGRAM DISPATCHER (HTML MODE - PLATFORM LINE REMOVED)
-# =====================================================================
-def send_telegram_alert(title, company, location, link, stipend, posted_time):
-    loc_clean = location.strip()
-    if "work from home" in loc_clean.lower():
-        loc_badge = "🏠 Work From Home"
-    elif "hybrid" in loc_clean.lower():
-        loc_badge = f"🏢 Hybrid ({loc_clean})"
-    else:
-        loc_badge = f"🏢 In-Office ({loc_clean})"
-
-    msg = (
-        f"🎯 <b>New Matched Opening!</b>\n\n"
-        f"🏢 <b>Company:</b> {company}\n"
-        f"💼 <b>Role:</b> {title}\n"
-        f"📍 <b>Location:</b> {loc_badge}\n"
-        f"💰 <b>Stipend/CTC:</b> {stipend}\n"
-        f"⏳ <b>Posted:</b> {posted_time}\n\n"
-        f'🔗 <a href="{link}"><b>Apply on Internshala</b></a>'
-    )
+def send_telegram_msg(msg: str):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": msg,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
-    }
-
-    for attempt in range(3):
-        try:
-            r = requests.post(url, json=payload, timeout=20)
-            return r.status_code == 200
-        except requests.exceptions.RequestException:
-            if attempt < 2:
-                time.sleep(2)
-                continue
-            return False
+    payload = {"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception:
+        pass
 
 # =====================================================================
-# BIT TORRENT BENCODE PARSER
+# IP WATCHDOG THREAD
+# =====================================================================
+def get_outbound_ip():
+    try:
+        return requests.get("https://api.ipify.org", timeout=10).text.strip()
+    except Exception:
+        return None
+
+def ip_watchdog_loop():
+    global CURRENT_PUBLIC_IP
+    time.sleep(10)
+    while True:
+        fresh_ip = get_outbound_ip()
+        if fresh_ip and fresh_ip != CURRENT_PUBLIC_IP:
+            old_ip = CURRENT_PUBLIC_IP
+            CURRENT_PUBLIC_IP = fresh_ip
+            if old_ip is None:
+                send_telegram_msg(f"🚀 <b>Render Container Booted!</b>\nPublic IP: <code>{fresh_ip}</code>")
+            else:
+                send_telegram_msg(f"⚠️ <b>IP Changed!</b>\nOld: <code>{old_ip}</code>\nNew: <code>{fresh_ip}</code>\n<i>Verify tracker profile if needed.</i>")
+        time.sleep(300) # Har 5 min me check
+
+# =====================================================================
+# BENCODE & TRACKER ANNOUNCE LOOP
 # =====================================================================
 def bdecode(data):
     def decode_item(idx):
@@ -151,16 +159,13 @@ def bencode(data):
 CLIENT_PEER_ID = "-TR3000-" + hashlib.md5(b"telemetry_stream_worker").hexdigest()[:12]
 CLIENT_HEADERS = {"User-Agent": "Transmission/3.00"}
 
-# =====================================================================
-# THREAD 1: BTSCHOOL TRACKER RE-ANNOUNCE LOOP
-# =====================================================================
 def sync_tracker_loop():
     time.sleep(5)
     session = requests.Session()
     session.headers.update(CLIENT_HEADERS)
 
     while True:
-        torrent_files = glob.glob("meta_cache/*.torrent")
+        torrent_files = glob.glob(f"{META_DIR}/*.torrent")
         print(f"\n[TRACKER] [{time.strftime('%H:%M:%S')}] Announce batch started: {len(torrent_files)} items.")
 
         for t_file in torrent_files:
@@ -208,204 +213,150 @@ def sync_tracker_loop():
         time.sleep(TRACKER_INTERVAL_SECONDS)
 
 # =====================================================================
-# THREAD 2: INTERNSHALA JOB HUNTER LOOP
+# JOB HUNTER (3 HOURS CYCLE + CLEAN MEMORY)
 # =====================================================================
-DOMAIN_PATTERNS = [
-    r"\b(ai|ml|genai|llm|rag|nlp|mlops)\b",
-    r"artificial\s+intelligence",
-    r"machine\s+learning",
-    r"deep\s+learning",
-    r"computer\s+vision",
-    r"data\s+scienc(e|tist)",
-    r"data\s+analy(st|tics)",
-    r"data\s+engineer(ing)?",
-    r"python\b",
-    r"prompt\s+engineer",
-    r"applied\s+scientist"
-]
-
-GENERIC_TECH_PATTERNS = [
-    r"\bsde\b",
-    r"software\s+developer",
-    r"software\s+engineer",
-    r"backend\s+developer",
-    r"backend\s+engineer",
-    r"full\s*stack"
-]
-
-EXCLUDE_PATTERNS = [
-    r"video\s+(creator|editor|making)",
-    r"instructor", r"trainer", r"teaching", r"tutor",
-    r"sales\b", r"\bbda\b", r"\bbde\b", r"business\s+development",
-    r"telecaller", r"executive\s+assistant", r"secretary",
-    r"event\s+management", r"graphic\s+design", r"content\s+writ",
-    r"\bphp\b", r"laravel", r"wordpress", r"\.net\b", r"\bc#\b",
-    r"java\s+developer"
-]
-
-ALLOWED_TECH_SKILLS = {
-    "python", "machine learning", "deep learning", "artificial intelligence", 
-    "data science", "fastapi", "flask", "django", "pytorch", "tensorflow", 
-    "opencv", "nlp", "langchain", "langgraph", "llm", "rag", "sql"
-}
+DOMAIN_PATTERNS = [r"\b(ai|ml|genai|llm|rag|nlp|mlops)\b", r"artificial\s+intelligence", r"machine\s+learning", r"deep\s+learning", r"computer\s+vision", r"data\s+scienc(e|tist)", r"data\s+analy(st|tics)", r"data\s+engineer(ing)?", r"python\b"]
+GENERIC_TECH_PATTERNS = [r"\bsde\b", r"software\s+developer", r"software\s+engineer", r"backend\s+developer"]
+EXCLUDE_PATTERNS = [r"instructor", r"trainer", r"sales\b", r"\bbda\b", r"telecaller", r"content\s+writ", r"\bphp\b", r"\.net\b"]
+ALLOWED_TECH_SKILLS = {"python", "machine learning", "deep learning", "artificial intelligence", "data science", "fastapi", "flask", "django", "pytorch", "tensorflow", "opencv", "sql"}
 
 def is_fresh_listing(posted_time: str) -> bool:
     pt = posted_time.lower().strip()
-    fresh_signals = [
-        "just now", "few hours", "hour ago", "hours ago",
-        "today", "yesterday", "1 day ago", "2 days ago",
-        "early applicant"
-    ]
-    return any(sig in pt for sig in fresh_signals)
+    return any(sig in pt for sig in ["just now", "few hours", "hour ago", "hours ago", "today", "yesterday", "1 day ago", "2 days ago", "early applicant"])
 
 def is_valid_match(title: str, snippet_text: str, stipend: str) -> bool:
-    title_lower = title.lower()
-    snippet_lower = snippet_text.lower()
-    stipend_lower = stipend.lower()
-
-    if "unpaid" in stipend_lower or "unpaid" in snippet_lower:
+    t_low, s_low, st_low = title.lower(), snippet_text.lower(), stipend.lower()
+    if "unpaid" in st_low or "unpaid" in s_low:
         return False
-
-    for exc in EXCLUDE_PATTERNS:
-        if re.search(exc, title_lower):
-            return False
-
-    for dom in DOMAIN_PATTERNS:
-        if re.search(dom, title_lower):
-            return True
-
-    is_generic = any(re.search(gen, title_lower) for gen in GENERIC_TECH_PATTERNS)
-    if is_generic:
-        if any(tech in snippet_lower for tech in ALLOWED_TECH_SKILLS):
-            return True
-
+    if any(re.search(exc, t_low) for exc in EXCLUDE_PATTERNS):
+        return False
+    if any(re.search(dom, t_low) for dom in DOMAIN_PATTERNS):
+        return True
+    if any(re.search(gen, t_low) for gen in GENERIC_TECH_PATTERNS):
+        return any(tech in s_low for tech in ALLOWED_TECH_SKILLS)
     return False
 
 def scrape_internshala(url, category, session, headers):
-    matches = 0
     try:
         res = session.get(url, headers=headers, timeout=20)
         if res.status_code != 200:
-            print(f"[JOB-HUNTER] ⚠️ Failed {category}: HTTP {res.status_code}")
-            return 0
-
+            return
         soup = BeautifulSoup(res.text, "html.parser")
         cards = soup.select(".individual_internship")
-
         for card in cards:
-            link = ""
-            if card.has_attr("data-href"):
-                link = "https://internshala.com" + card["data-href"]
-            else:
+            link = card.get("data-href")
+            if not link:
                 a_tag = card.select_one("a.view_detail_button, h3 a, .job-title-href")
                 if a_tag and a_tag.get("href"):
-                    href = a_tag["href"]
-                    link = href if href.startswith("http") else "https://internshala.com" + href
-
-            if not link or link == "https://internshala.com":
+                    link = a_tag["href"]
+            if not link:
                 continue
+            link = link if link.startswith("http") else "https://internshala.com" + link
 
             job_id_match = re.search(r'-(\d+)$', link)
             job_id = f"IS_{job_id_match.group(1)}" if job_id_match else f"IS_{link}"
-
             if is_job_seen(job_id):
                 continue
 
             title_tag = card.select_one(".job-internship-name, .profile, h3 a")
             title = title_tag.get_text(strip=True) if title_tag else "N/A"
-
-            company_tag = card.select_one(".company-name, .company_name, .heading_6_company")
-            company = company_tag.get_text(strip=True) if company_tag else "N/A"
-            company = re.sub(r'Actively hiring.*', '', company).strip()
-
+            comp_tag = card.select_one(".company-name, .company_name, .heading_6_company")
+            company = re.sub(r'Actively hiring.*', '', comp_tag.get_text(strip=True)) if comp_tag else "N/A"
             loc_tag = card.select_one(".locations, #location_names, .location_link")
-            location = loc_tag.get_text(strip=True) if loc_tag else "Location Not Specified"
-
+            location = loc_tag.get_text(strip=True) if loc_tag else "Remote"
             stipend_tag = card.select_one(".stipend, .salary")
             stipend = stipend_tag.get_text(strip=True) if stipend_tag else "Not specified"
-
             posted_time = "Recently"
             status_tag = card.select_one(".status-success, .status-inactive, .posted_by_container, .status-info")
             if status_tag:
                 posted_time = status_tag.get_text(" ", strip=True)
 
-            card_full_text = card.get_text(" ", strip=True)
+            if is_valid_match(title, card.get_text(" ", strip=True), stipend) and is_fresh_listing(posted_time):
+                msg = f"🎯 <b>New Matched Opening!</b>\n\n🏢 <b>Company:</b> {company}\n💼 <b>Role:</b> {title}\n📍 <b>Location:</b> {location}\n💰 <b>Stipend/CTC:</b> {stipend}\n⏳ <b>Posted:</b> {posted_time}\n\n🔗 <a href='{link}'><b>Apply on Internshala</b></a>"
+                send_telegram_msg(msg)
+                mark_job_seen(job_id, "Internshala", title)
+                time.sleep(1)
 
-            if is_valid_match(title, card_full_text, stipend) and is_fresh_listing(posted_time):
-                matches += 1
-                print(f"[JOB-HUNTER] 🔥 Match: {title} @ {company} ({location})")
-                sent = send_telegram_alert(title, company, location, link, stipend, posted_time)
-                if sent:
-                    print(f"[JOB-HUNTER] -> 📱 Telegram alert sent for {title}")
-                    mark_job_seen(job_id, "Internshala", title)
-                time.sleep(1.2)
-
+        del cards
+        del soup
+        del res
+        gc.collect()
     except Exception as e:
-        print(f"[JOB-HUNTER] ⚠️ Scraper error in {category}: {e}")
-
-    return matches
+        print(f"[JOB-HUNTER] Error: {e}")
 
 def job_hunter_loop():
     init_db()
-    time.sleep(15)  # Initial container startup buffer
+    time.sleep(15)
     session = requests.Session()
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36"}
     targets = [
         ("Internships", "https://internshala.com/internships/artificial-intelligence-ai,data-science,machine-learning,python-django-internship/"),
         ("Fresher Jobs", "https://internshala.com/jobs/artificial-intelligence-ai,data-science,machine-learning,python-django-jobs/")
     ]
-
-    print("[JOB-HUNTER] Engine initialized.")
     while True:
-        print(f"\n[JOB-HUNTER] [{time.strftime('%H:%M:%S')}] Checking latest listings...")
-        for category, url in targets:
-            scrape_internshala(url, category, session, headers)
+        cleanup_old_seen_jobs()
+        for cat, url in targets:
+            scrape_internshala(url, cat, session, headers)
         time.sleep(JOB_INTERVAL_SECONDS)
 
 # =====================================================================
-# THREAD 3: FASTAPI HEALTH & METRICS ENDPOINT (UptimeRobot / Cron-Job)
+# TELEGRAM POLLER (ONLY /status)
+# =====================================================================
+def telegram_poller():
+    offset = 0
+    time.sleep(5)
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getUpdates?offset={offset}&timeout=20"
+            r = requests.get(url, timeout=25).json()
+            if not r.get("ok"):
+                time.sleep(5)
+                continue
+
+            for item in r.get("result", []):
+                offset = item["update_id"] + 1
+                msg = item.get("message", {})
+                chat_id = str(msg.get("chat", {}).get("id"))
+                if chat_id != str(TG_CHAT_ID):
+                    continue
+
+                text = msg.get("text", "").strip()
+                if text == "/status":
+                    mem = psutil.Process().memory_info().rss / (1024 * 1024)
+                    uptime_seconds = int(time.time() - START_TIME)
+                    days = uptime_seconds // 86400
+                    hours = (uptime_seconds % 86400) // 3600
+                    minutes = (uptime_seconds % 3600) // 60
+                    uptime_str = f"{days}d {hours}h {minutes}m"
+
+                    send_telegram_msg(f"📊 <b>Container Health</b>\n\n🧠 <b>RAM Usage:</b> {mem:.2f} MB\n⏱️ <b>Uptime:</b> {uptime_str}")
+        except Exception:
+            time.sleep(5)
+
+# =====================================================================
+# FASTAPI ENDPOINTS (FOR CLI PUSH - NO RESTART)
 # =====================================================================
 @app.api_route("/", methods=["GET", "HEAD"])
 def ping_service():
-    process = psutil.Process()
-    ram_mb = process.memory_info().rss / (1024 * 1024)
-    cpu_usage = psutil.cpu_percent(interval=None)
+    mem = psutil.Process().memory_info().rss / (1024 * 1024)
+    return {"status": "active", "ram_mb": round(mem, 2)}
 
-    total_tracked_jobs = 0
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM seen_jobs")
-        total_tracked_jobs = c.fetchone()[0]
-        conn.close()
-    except Exception:
-        pass
+@app.post("/upload-torrent")
+async def upload_torrent(file: UploadFile = File(...)):
+    if not file.filename.endswith(".torrent"):
+        raise HTTPException(status_code=400, detail="Only .torrent files allowed")
+    file_path = os.path.join(META_DIR, file.filename)
+    with open(file_path, "wb") as buffer:
+        content = await file.read()
+        buffer.write(content)
+    return {"status": "success", "file": file.filename}
 
-    return {
-        "status": "active",
-        "node": "telemetry-sync",
-        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "metrics": {
-            "ram_usage_mb": round(ram_mb, 2),
-            "cpu_percent": cpu_usage,
-            "total_jobs_seen": total_tracked_jobs
-        }
-    }
-
-# =====================================================================
-# STARTUP DAEMON WORKERS
-# =====================================================================
 @app.on_event("startup")
-def start_workers():
-    t_tracker = threading.Thread(target=sync_tracker_loop, daemon=True)
-    t_jobs = threading.Thread(target=job_hunter_loop, daemon=True)
-    t_tracker.start()
-    t_jobs.start()
+def start_all():
+    threading.Thread(target=sync_tracker_loop, daemon=True).start()
+    threading.Thread(target=job_hunter_loop, daemon=True).start()
+    threading.Thread(target=ip_watchdog_loop, daemon=True).start()
+    threading.Thread(target=telegram_poller, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
