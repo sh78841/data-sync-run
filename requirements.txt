@@ -5,3 +5,4 @@ bencode.py
 rich
 beautifulsoup4
 psutil
+python-multipart
