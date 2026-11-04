@@ -30,8 +30,11 @@ META_DIR = "meta_cache"
 
 os.makedirs(META_DIR, exist_ok=True)
 
+# CPU metric baseline initialize
+psutil.cpu_percent(interval=None)
+
 # =====================================================================
-# DATABASE & RETENTION (2 DAYS PURGE)
+# DATABASE & RETENTION (2 DAYS AUTO-PURGE)
 # =====================================================================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -75,36 +78,56 @@ def mark_job_seen(job_id: str, source: str, title: str):
 def send_telegram_msg(msg: str):
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "HTML"}
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception:
-        pass
+    for attempt in range(3):
+        try:
+            r = requests.post(url, json=payload, timeout=12)
+            if r.status_code == 200:
+                return True
+            print(f"[TG] Error code: {r.status_code}")
+        except Exception as e:
+            print(f"[TG] Attempt {attempt+1}/3 failed: {e}")
+            time.sleep(2)
+    return False
 
 # =====================================================================
-# IP WATCHDOG THREAD
+# IP WATCHDOG THREAD (MULTI-SOURCE FALLBACK)
 # =====================================================================
 def get_outbound_ip():
-    try:
-        return requests.get("https://api.ipify.org", timeout=10).text.strip()
-    except Exception:
-        return None
+    services = [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com"
+    ]
+    for url in services:
+        try:
+            res = requests.get(url, timeout=7)
+            if res.status_code == 200:
+                ip_clean = res.text.strip()
+                if ip_clean and len(ip_clean) <= 45:
+                    return ip_clean
+        except Exception:
+            continue
+    return None
 
 def ip_watchdog_loop():
     global CURRENT_PUBLIC_IP
-    time.sleep(10)
+    time.sleep(8)
     while True:
         fresh_ip = get_outbound_ip()
-        if fresh_ip and fresh_ip != CURRENT_PUBLIC_IP:
-            old_ip = CURRENT_PUBLIC_IP
-            CURRENT_PUBLIC_IP = fresh_ip
-            if old_ip is None:
+        if fresh_ip:
+            if CURRENT_PUBLIC_IP is None:
+                CURRENT_PUBLIC_IP = fresh_ip
+                print(f"[WATCHDOG] Outbound IP: {fresh_ip}")
                 send_telegram_msg(f"🚀 <b>Render Container Booted!</b>\nPublic IP: <code>{fresh_ip}</code>")
-            else:
+            elif fresh_ip != CURRENT_PUBLIC_IP:
+                old_ip = CURRENT_PUBLIC_IP
+                CURRENT_PUBLIC_IP = fresh_ip
+                print(f"[WATCHDOG] IP Changed: {old_ip} -> {fresh_ip}")
                 send_telegram_msg(f"⚠️ <b>IP Changed!</b>\nOld: <code>{old_ip}</code>\nNew: <code>{fresh_ip}</code>\n<i>Verify tracker profile if needed.</i>")
-        time.sleep(300) # Har 5 min me check
+        time.sleep(180)  # Check every 3 mins
 
 # =====================================================================
-# BENCODE & TRACKER ANNOUNCE LOOP
+# BENCODE PARSER
 # =====================================================================
 def bdecode(data):
     def decode_item(idx):
@@ -159,6 +182,9 @@ def bencode(data):
 CLIENT_PEER_ID = "-TR3000-" + hashlib.md5(b"telemetry_stream_worker").hexdigest()[:12]
 CLIENT_HEADERS = {"User-Agent": "Transmission/3.00"}
 
+# =====================================================================
+# THREAD 1: TRACKER ANNOUNCE LOOP + AUTO-EVACUATE GUARD
+# =====================================================================
 def sync_tracker_loop():
     time.sleep(5)
     session = requests.Session()
@@ -204,6 +230,41 @@ def sync_tracker_loop():
                 file_label = info.get('name', os.path.basename(t_file))
                 if isinstance(file_label, bytes):
                     file_label = file_label.decode('utf-8', errors='ignore')
+
+                # =========================================================
+                # AUTO-EVACUATE RISK EVALUATION
+                # =========================================================
+                try:
+                    resp_data = bdecode(resp.content)
+                    seeders = resp_data.get('complete', 99)
+                    leechers = resp_data.get('incomplete', 0)
+
+                    # Trigger: 2 ya kam seeders aur leecher ghus chuka ho
+                    if seeders <= 2 and leechers >= 1:
+                        print(f"[SECURITY] Evacuating {file_label[:25]} (Seeders: {seeders}, Leechers: {leechers})")
+                        
+                        # 1. Tracker se silent stop handshake
+                        params['event'] = 'stopped'
+                        try:
+                            session.get(announce_target, params=params, timeout=10)
+                        except Exception:
+                            pass
+                        
+                        # 2. Local cache se torrent delete
+                        if os.path.exists(t_file):
+                            os.remove(t_file)
+
+                        # 3. Inform via Telegram
+                        send_telegram_msg(
+                            f"🛡️ <b>Auto-Evacuated Torrent!</b>\n\n"
+                            f"📁 <b>File:</b> <code>{file_label[:30]}</code>\n"
+                            f"⚠️ <b>Seeders:</b> {seeders} | <b>Leechers:</b> {leechers}\n"
+                            f"<i>Unconnectable collision risk se bachne ke liye safe exit liya gaya.</i>"
+                        )
+                        continue
+                except Exception:
+                    pass
+
                 print(f"[TRACKER] 📡 [Synced] {file_label[:25]} | HTTP {resp.status_code}")
                 time.sleep(1)
 
@@ -213,7 +274,7 @@ def sync_tracker_loop():
         time.sleep(TRACKER_INTERVAL_SECONDS)
 
 # =====================================================================
-# JOB HUNTER (3 HOURS CYCLE + CLEAN MEMORY)
+# THREAD 2: INTERNSHALA JOB HUNTER (3 HOURS CYCLE + GC)
 # =====================================================================
 DOMAIN_PATTERNS = [r"\b(ai|ml|genai|llm|rag|nlp|mlops)\b", r"artificial\s+intelligence", r"machine\s+learning", r"deep\s+learning", r"computer\s+vision", r"data\s+scienc(e|tist)", r"data\s+analy(st|tics)", r"data\s+engineer(ing)?", r"python\b"]
 GENERIC_TECH_PATTERNS = [r"\bsde\b", r"software\s+developer", r"software\s+engineer", r"backend\s+developer"]
@@ -300,7 +361,7 @@ def job_hunter_loop():
         time.sleep(JOB_INTERVAL_SECONDS)
 
 # =====================================================================
-# TELEGRAM POLLER (ONLY /status)
+# THREAD 3: TELEGRAM POLLER (/status)
 # =====================================================================
 def telegram_poller():
     offset = 0
@@ -323,23 +384,39 @@ def telegram_poller():
                 text = msg.get("text", "").strip()
                 if text == "/status":
                     mem = psutil.Process().memory_info().rss / (1024 * 1024)
+                    cpu = psutil.cpu_percent(interval=None)
                     uptime_seconds = int(time.time() - START_TIME)
                     days = uptime_seconds // 86400
                     hours = (uptime_seconds % 86400) // 3600
                     minutes = (uptime_seconds % 3600) // 60
                     uptime_str = f"{days}d {hours}h {minutes}m"
+                    active_torrents = len(glob.glob(f"{META_DIR}/*.torrent"))
 
-                    send_telegram_msg(f"📊 <b>Container Health</b>\n\n🧠 <b>RAM Usage:</b> {mem:.2f} MB\n⏱️ <b>Uptime:</b> {uptime_str}")
+                    send_telegram_msg(
+                        f"📊 <b>Container Health</b>\n\n"
+                        f"🧠 <b>RAM Usage:</b> {mem:.2f} MB\n"
+                        f"⚡ <b>CPU Usage:</b> {cpu}%\n"
+                        f"📁 <b>Active Torrents:</b> {active_torrents}\n"
+                        f"🌐 <b>Public IP:</b> <code>{CURRENT_PUBLIC_IP or 'Detecting...'}</code>\n"
+                        f"⏱️ <b>Uptime:</b> {uptime_str}"
+                    )
         except Exception:
             time.sleep(5)
 
 # =====================================================================
-# FASTAPI ENDPOINTS (FOR CLI PUSH - NO RESTART)
+# FASTAPI ENDPOINTS
 # =====================================================================
 @app.api_route("/", methods=["GET", "HEAD"])
 def ping_service():
     mem = psutil.Process().memory_info().rss / (1024 * 1024)
-    return {"status": "active", "ram_mb": round(mem, 2)}
+    cpu = psutil.cpu_percent(interval=None)
+    return {
+        "status": "active",
+        "ram_mb": round(mem, 2),
+        "cpu_percent": cpu,
+        "public_ip": CURRENT_PUBLIC_IP,
+        "active_torrents": len(glob.glob(f"{META_DIR}/*.torrent"))
+    }
 
 @app.post("/upload-torrent")
 async def upload_torrent(file: UploadFile = File(...)):
